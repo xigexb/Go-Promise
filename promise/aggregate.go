@@ -52,7 +52,8 @@ func All[T any](promises ...*Promise[T]) *Promise[[]T] {
 		}
 
 		results := make([]T, count)
-		var pending int32 = int32(count)
+		// Fix ST1023: Use short variable declaration for inferred type
+		pending := int32(count)
 		var doneFlag int32 = 0 // 0: running, 1: done (rejected or finished)
 
 		for i, p := range promises {
@@ -92,7 +93,8 @@ func Any[T any](promises ...*Promise[T]) *Promise[T] {
 			return
 		}
 
-		var pending int32 = int32(len(promises))
+		// Fix ST1023: Use short variable declaration
+		pending := int32(len(promises))
 		var successFlag int32 = 0
 
 		for _, p := range promises {
@@ -152,7 +154,8 @@ func AllSettled[T any](promises ...*Promise[T]) *Promise[[]SettledResult[T]] {
 		}
 
 		results := make([]SettledResult[T], count)
-		var pending int32 = int32(count)
+		// Fix ST1023: Use short variable declaration
+		pending := int32(count)
 
 		for i, p := range promises {
 			idx := i

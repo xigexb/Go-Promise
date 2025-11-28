@@ -185,8 +185,9 @@ func (p *Promise[T]) runHandlers(head *handlerNode) {
 	for current != nil {
 		func(fn func()) {
 			defer func() {
+				// Fix SA9003: explicit ignore
 				if r := recover(); r != nil {
-					// ignore panic inside handler
+					_ = r
 				}
 			}()
 			fn()
@@ -206,16 +207,17 @@ func (p *Promise[T]) Then(onFulfilled func(T) T, onRejected func(error) error) *
 	// 2. 定义处理逻辑 (闭包捕获 child)
 	handle := func() {
 		defer handlePanic(child.Reject)
-		currentState := p.GetState()
 
-		if currentState == Fulfilled {
+		// Fix QF1003: Use switch for state check
+		switch p.GetState() {
+		case Fulfilled:
 			if onFulfilled != nil {
 				res := onFulfilled(p.val)
 				child.Resolve(res)
 			} else {
 				child.Resolve(p.val)
 			}
-		} else if currentState == Rejected {
+		case Rejected:
 			if onRejected != nil {
 				err := onRejected(p.err)
 				// 注意：在当前实现中，Catch 返回的是 error，所以继续 Reject
