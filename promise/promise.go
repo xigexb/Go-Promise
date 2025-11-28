@@ -27,7 +27,7 @@ func (s State) String() string {
 }
 
 // -------------------------------------------------------
-// 极致优化 I: 使用对象池复用回调节点，消除切片扩容的 allocs
+// 内部链表节点池化 (减少 GC 压力)
 // -------------------------------------------------------
 
 type handlerNode struct {
@@ -41,7 +41,6 @@ var handlerNodePool = sync.Pool{
 	},
 }
 
-// 获取节点
 func getHandlerNode(fn func()) *handlerNode {
 	node := handlerNodePool.Get().(*handlerNode)
 	node.fn = fn
@@ -49,11 +48,10 @@ func getHandlerNode(fn func()) *handlerNode {
 	return node
 }
 
-// 回收链表 (Iterative to avoid recursion stack overflow)
 func putHandlerChain(head *handlerNode) {
 	for head != nil {
 		next := head.next
-		head.fn = nil // 防止内存泄漏
+		head.fn = nil // 防止闭包引用泄漏
 		head.next = nil
 		handlerNodePool.Put(head)
 		head = next
@@ -61,18 +59,17 @@ func putHandlerChain(head *handlerNode) {
 }
 
 // -------------------------------------------------------
+// Promise 核心结构体
+// -------------------------------------------------------
 
 type Promise[T any] struct {
-	state uint32     // 原子状态
-	mu    sync.Mutex // 锁
-
-	val T
-	err error
-
-	// 优化：使用链表替代切片 []func()
-	handlers *handlerNode
-
-	signal chan struct{}
+	val          T
+	err          error
+	handlers     *handlerNode // 链表头
+	handlersTail *handlerNode // 链表尾 (尾插法)
+	signal       chan struct{}
+	mu           sync.Mutex
+	state        uint32
 }
 
 // New 创建 Promise
@@ -87,42 +84,30 @@ func New[T any](executor func(resolve func(T), reject func(error))) *Promise[T] 
 	return p
 }
 
-// NewWithContext 支持 Context
+// NewWithContext 包含 Context 支持
 func NewWithContext[T any](ctx context.Context, executor func(resolve func(T), reject func(error))) *Promise[T] {
 	p := &Promise[T]{}
 
 	GlobalDispatcher.Dispatch(func() {
 		defer handlePanic(p.Reject)
-		done := make(chan struct{})
+
+		if ctx.Err() != nil {
+			p.Reject(ctx.Err())
+			return
+		}
+
+		stop := context.AfterFunc(ctx, func() {
+			p.Reject(ctx.Err())
+		})
 
 		safeResolve := func(v T) {
-			select {
-			case <-done:
-				return
-			default:
-				close(done)
-				p.Resolve(v)
-			}
+			stop()
+			p.Resolve(v)
 		}
-
 		safeReject := func(e error) {
-			select {
-			case <-done:
-				return
-			default:
-				close(done)
-				p.Reject(e)
-			}
+			stop()
+			p.Reject(e)
 		}
-
-		go func() {
-			select {
-			case <-ctx.Done():
-				safeReject(ctx.Err())
-			case <-done:
-				return
-			}
-		}()
 
 		executor(safeResolve, safeReject)
 	})
@@ -134,7 +119,7 @@ func (p *Promise[T]) GetState() State {
 	return State(atomic.LoadUint32(&p.state))
 }
 
-// Resolve 极速路径 + 链表执行
+// Resolve 触发 Promise 完成
 func (p *Promise[T]) Resolve(val T) {
 	if atomic.LoadUint32(&p.state) != uint32(Pending) {
 		return
@@ -152,19 +137,19 @@ func (p *Promise[T]) doResolve(val T) {
 	p.val = val
 	atomic.StoreUint32(&p.state, uint32(Fulfilled))
 
-	// 截断链表，取出所有回调
 	h := p.handlers
-	p.handlers = nil // 释放引用
+	p.handlers = nil
+	p.handlersTail = nil
 
 	if p.signal != nil {
 		close(p.signal)
 	}
 	p.mu.Unlock()
 
-	// 锁外执行回调
 	p.runHandlers(h)
 }
 
+// Reject 触发 Promise 拒绝
 func (p *Promise[T]) Reject(err error) {
 	if atomic.LoadUint32(&p.state) != uint32(Pending) {
 		return
@@ -184,6 +169,7 @@ func (p *Promise[T]) doReject(err error) {
 
 	h := p.handlers
 	p.handlers = nil
+	p.handlersTail = nil
 
 	if p.signal != nil {
 		close(p.signal)
@@ -197,11 +183,10 @@ func (p *Promise[T]) doReject(err error) {
 func (p *Promise[T]) runHandlers(head *handlerNode) {
 	current := head
 	for current != nil {
-		// 捕获 panic 保护
 		func(fn func()) {
 			defer func() {
 				if r := recover(); r != nil {
-					// logs or ignore? internal callbacks should be safe
+					// ignore panic inside handler
 				}
 			}()
 			fn()
@@ -209,86 +194,111 @@ func (p *Promise[T]) runHandlers(head *handlerNode) {
 
 		current = current.next
 	}
-
-	// 执行完后，归还所有节点到池中
 	putHandlerChain(head)
 }
 
-// Then 优化：使用链表挂载
+// Then 链式调用
+// 修复核心：手动创建 child promise，并在当前 Goroutine 同步注册回调，保证顺序。
 func (p *Promise[T]) Then(onFulfilled func(T) T, onRejected func(error) error) *Promise[T] {
-	return New(func(resolve func(T), reject func(error)) {
-		handle := func() {
-			defer handlePanic(reject)
-			currentState := p.GetState()
-			if currentState == Fulfilled {
-				if onFulfilled != nil {
-					resolve(onFulfilled(p.val))
-				} else {
-					resolve(p.val)
-				}
-			} else if currentState == Rejected {
-				if onRejected != nil {
-					reject(onRejected(p.err))
-				} else {
-					reject(p.err)
-				}
+	// 1. 手动创建 Child Promise (不通过 New 启动 Goroutine)
+	child := &Promise[T]{}
+
+	// 2. 定义处理逻辑 (闭包捕获 child)
+	handle := func() {
+		defer handlePanic(child.Reject)
+		currentState := p.GetState()
+
+		if currentState == Fulfilled {
+			if onFulfilled != nil {
+				res := onFulfilled(p.val)
+				child.Resolve(res)
+			} else {
+				child.Resolve(p.val)
+			}
+		} else if currentState == Rejected {
+			if onRejected != nil {
+				err := onRejected(p.err)
+				// 注意：在当前实现中，Catch 返回的是 error，所以继续 Reject
+				child.Reject(err)
+			} else {
+				child.Reject(p.err)
 			}
 		}
+	}
 
-		if p.GetState() != Pending {
-			handle()
-			return
-		}
-
+	// 3. 同步注册 (Synchronous Registration)
+	// 只有这样才能保证 TestPromise_ExecutionOrder_FIFO 中的调用顺序
+	if p.GetState() != Pending {
+		GlobalDispatcher.Dispatch(handle)
+	} else {
 		p.mu.Lock()
 		if p.state != uint32(Pending) {
 			p.mu.Unlock()
-			handle()
+			GlobalDispatcher.Dispatch(handle)
 		} else {
-			// 优化：从池中获取节点，挂载到链表头部 (头插法效率最高)
+			// 尾插法
 			node := getHandlerNode(handle)
-			node.next = p.handlers
-			p.handlers = node
+			if p.handlers == nil {
+				p.handlers = node
+				p.handlersTail = node
+			} else {
+				p.handlersTail.next = node
+				p.handlersTail = node
+			}
 			p.mu.Unlock()
 		}
-	})
+	}
+
+	return child
 }
 
 func (p *Promise[T]) Catch(onRejected func(error) error) *Promise[T] {
 	return p.Then(nil, onRejected)
 }
 
+// Finally 链式调用
 func (p *Promise[T]) Finally(onFinally func()) *Promise[T] {
-	return New(func(resolve func(T), reject func(error)) {
-		handle := func() {
-			defer handlePanic(reject)
-			onFinally()
-			if p.GetState() == Fulfilled {
-				resolve(p.val)
-			} else {
-				reject(p.err)
-			}
-		}
+	// 1. 手动创建 Child Promise
+	child := &Promise[T]{}
 
-		if p.GetState() != Pending {
-			handle()
-			return
+	// 2. 定义处理逻辑
+	handle := func() {
+		defer handlePanic(child.Reject)
+		onFinally()
+		// Finally 不改变结果，除非 Panic
+		if p.GetState() == Fulfilled {
+			child.Resolve(p.val)
+		} else {
+			child.Reject(p.err)
 		}
+	}
 
+	// 3. 同步注册
+	if p.GetState() != Pending {
+		GlobalDispatcher.Dispatch(handle)
+	} else {
 		p.mu.Lock()
 		if p.state != uint32(Pending) {
 			p.mu.Unlock()
-			handle()
+			GlobalDispatcher.Dispatch(handle)
 		} else {
+			// 尾插法
 			node := getHandlerNode(handle)
-			node.next = p.handlers
-			p.handlers = node
+			if p.handlers == nil {
+				p.handlers = node
+				p.handlersTail = node
+			} else {
+				p.handlersTail.next = node
+				p.handlersTail = node
+			}
 			p.mu.Unlock()
 		}
-	})
+	}
+
+	return child
 }
 
-// Await 保持不变
+// Await 阻塞等待结果
 func (p *Promise[T]) Await(ctx context.Context) (T, error) {
 	if s := p.GetState(); s == Fulfilled {
 		return p.val, nil
@@ -316,7 +326,7 @@ func (p *Promise[T]) Await(ctx context.Context) (T, error) {
 	case <-ctx.Done():
 		return *new(T), ctx.Err()
 	case <-sig:
-		if p.state == uint32(Fulfilled) {
+		if p.GetState() == Fulfilled {
 			return p.val, nil
 		}
 		return *new(T), p.err

@@ -5,12 +5,12 @@ import (
 )
 
 // TaskDispatcher 定义任务调度器接口
-// 高并发场景下，建议使用协程池（如 ants）实现此接口以复用 Goroutine
+// 高并发场景下，建议通过 SetDispatcher 注入协程池（如 ants）以复用 Goroutine
 type TaskDispatcher interface {
 	Dispatch(func())
 }
 
-// defaultDispatcher 默认使用原生 Goroutine，适合大多数场景
+// defaultDispatcher 默认使用原生 Goroutine
 type defaultDispatcher struct{}
 
 func (d *defaultDispatcher) Dispatch(f func()) {
@@ -18,11 +18,11 @@ func (d *defaultDispatcher) Dispatch(f func()) {
 }
 
 var (
-	// GlobalDispatcher 全局调度器
+	// GlobalDispatcher 全局调度器，默认为原生 go func
 	GlobalDispatcher TaskDispatcher = &defaultDispatcher{}
 )
 
-// SetDispatcher 允许替换全局调度器
+// SetDispatcher 允许替换全局调度器 (例如注入 ants)
 func SetDispatcher(d TaskDispatcher) {
 	GlobalDispatcher = d
 }
@@ -34,6 +34,9 @@ func handlePanic(reject func(error)) {
 		if !ok {
 			err = fmt.Errorf("panic: %v", r)
 		}
-		reject(err)
+		// 确保 reject 存在
+		if reject != nil {
+			reject(err)
+		}
 	}
 }

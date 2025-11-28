@@ -5,7 +5,7 @@ import (
 	"time"
 )
 
-// Resolve 静态方法：立即成功
+// Resolve 静态方法
 func Resolve[T any](val T) *Promise[T] {
 	return &Promise[T]{
 		state: uint32(Fulfilled),
@@ -13,7 +13,7 @@ func Resolve[T any](val T) *Promise[T] {
 	}
 }
 
-// Reject 静态方法：立即失败
+// Reject 静态方法
 func Reject[T any](err error) *Promise[T] {
 	return &Promise[T]{
 		state: uint32(Rejected),
@@ -34,7 +34,7 @@ func Delay(d time.Duration) *Promise[struct{}] {
 func (p *Promise[T]) Timeout(d time.Duration, msg string) *Promise[T] {
 	return New(func(resolve func(T), reject func(error)) {
 		timer := time.NewTimer(d)
-		defer timer.Stop()
+		defer timer.Stop() // 确保 timer 资源释放
 
 		done := make(chan struct{})
 
@@ -66,7 +66,7 @@ func (p *Promise[T]) Timeout(d time.Duration, msg string) *Promise[T] {
 	})
 }
 
-// Tap 副作用钩子
+// Tap 副作用钩子 (不改变值)
 func (p *Promise[T]) Tap(onTap func(val T, err error)) *Promise[T] {
 	return p.Then(func(val T) T {
 		onTap(val, nil)
